@@ -1,357 +1,362 @@
+/*
+ * GotoXYPHI_UART - low-level controller of the robot (Arduino Uno)
+ *
+ * Takes a goal pose (x, y, phi) from the Raspberry Pi over UART, drives the
+ * robot there using wheel-encoder odometry, then turns in place to the final
+ * heading. It also streams odometry back to the Pi every 50 ms.
+ *
+ * Control structure (all loops tick every 10 ms):
+ *
+ *   goal -> [v PID] -+                          +-> [right wheel PID] -> L298N -> motor
+ *           [w PID] -+-> (v, w) -> wheel speeds -+-> [left wheel PID]  -> L298N -> motor
+ *    ^                                                                             |
+ *    +------------------ odometry (x, y, phi) <------ encoders <-------------------+
+ *
+ * Serial protocol (115200 baud, one command per line):
+ *   "x,y,phi"     go to (x, y) in cm, then rotate to phi in degrees
+ *   "ROTATE,phi"  rotate in place to the absolute heading phi (degrees)
+ *   "STOP"        stop right where you are
+ *
+ * Replies:
+ *   "x,y,phi,targetL,targetR,speedL,pwmL,speedR,pwmR"  telemetry, every 50 ms
+ *   "Target Reached."                                  position reached
+ *   "Orientation Reached."                             final heading reached
+ *
+ * Arshia Goshtasbi - BSc final project, IUST, 1403
+ */
+
 #include <util/atomic.h>
 
-int flagStop = 0;
+// --- Pins -------------------------------------------------------------------
+// L298N inputs. Speed is set with PWM directly on these pins, ENA/ENB only
+// act as enables.
+const uint8_t LEFT_IN1 = 11;
+const uint8_t LEFT_IN2 = 10;
+const uint8_t RIGHT_IN1 = 6;
+const uint8_t RIGHT_IN2 = 5;
 
-volatile double targetX = 0.0;
-volatile double targetY = 0.0;
-volatile double targetPhi_g = 0.0;
+// Encoders: channel A goes to an interrupt pin, channel B is read inside the
+// ISR to get the direction.
+const uint8_t RIGHT_ENC_A = 2;
+const uint8_t RIGHT_ENC_B = 8;
+const uint8_t LEFT_ENC_A = 3;
+const uint8_t LEFT_ENC_B = 7;
 
-// Robot state variables
-volatile float x = 0.0;
-volatile float y = 0.0;
-volatile float phi = 0.0;
+// --- Robot geometry ---------------------------------------------------------
+const float PULSES_PER_REV = 2625.0;  // encoder pulses per wheel revolution
+const float WHEEL_RADIUS = 3.0;       // cm
+const float WHEEL_BASE = 20.5;        // distance between the wheels, cm
 
-// Control gains
-const double positionTolerance = 5.0; // Tolerance for reaching the goal position (cm)
-const double angleTolerance = 0.03;    // Tolerance for reaching the goal orientation (radians)
+// --- Control settings -------------------------------------------------------
+const unsigned long CONTROL_PERIOD_MS = 10;
+const unsigned long TELEMETRY_PERIOD_MS = 50;
 
-// Motor pins
-const int IN3 = 6;
-const int IN4 = 5;
-const int IN1 = 11;
-const int IN2 = 10;
+const float POSITION_TOLERANCE = 5.0;  // cm
+const float ANGLE_TOLERANCE = 0.03;    // rad (~1.7 deg)
+const float MAX_LINEAR_CMD = 300.0;    // limit on the v PID output
+const float MAX_TURN_CMD = 30.0;       // limit on the w PID output while turning in place
 
-// Encoder pulse pins
-const int pulsePinR1 = 2;
-const int pulsePinR2 = 8;
-const int pulsePinL1 = 3;
-const int pulsePinL2 = 7;
+// More pulses than this in one 10 ms tick means faster than the motor's top
+// speed (~360 rpm), so it's treated as an encoder glitch and the tick is skipped.
+const int MAX_PULSES_PER_TICK = 158;
 
-const float pulsePerRev = 2625.0; // Encoder pulses per revolution
-const float wheelRadius = 3.0;    // Wheel radius in cm
-const float wheelBase = 20.5;     // Distance between wheels (track width) in cm
-
-// Globals
-volatile long pos_i_right = 0;
-volatile long pos_i_left = 0;
-float v1Filt = 0, v1Prev = 0;
-float v2Filt = 0, v2Prev = 0;
-unsigned long lastControlTime = 0; // Timer for 10ms intervals
-unsigned long lastControlTimeTheta = 0;
-// Define target velocities for both motors
-volatile float targetVelocityRight = 0; // Adjust as needed
-volatile float targetVelocityLeft = 0;  // Adjust as needed
-
-volatile float velocityLeft = 0;
-volatile float velocityRight = 0;
-volatile int pwmLeft = 0;
-volatile int pwmRight = 0;
-
-// PID Class
+// --- PID --------------------------------------------------------------------
+// Note: the D term is the raw difference between two samples (not divided by
+// dt). All the gains below were tuned on the robot this way, so it stays.
 class PIDController {
-  public:
-    float kp, ki, kd;
-    float eintegral, e_old;
-    
-    PIDController(float kp_, float ki_, float kd_) {
-      kp = kp_;
-      ki = ki_;
-      kd = kd_;
-      eintegral = 0;
-      e_old = 0;
-    }
+ public:
+  PIDController(float kp, float ki, float kd) : kp_(kp), ki_(ki), kd_(kd) {}
 
-    float compute(float targetVelocity, float currentVelocity, float deltaT) {
-      float e = targetVelocity - currentVelocity;  // Error term
-      eintegral += e * deltaT;                     // Integral term
-      float e_dot = (e - e_old);                   // Derivative term (change in error)
-      e_old = e;                                   // Update old error
+  float compute(float target, float current, float dt) {
+    float error = target - current;
+    integral_ += error * dt;
+    float derivative = error - prevError_;
+    prevError_ = error;
+    return kp_ * error + ki_ * integral_ + kd_ * derivative;
+  }
 
-      float controlSignal = kp * e + ki * eintegral + kd * e_dot; // PID equation
-      return controlSignal;
-    }
+ private:
+  float kp_, ki_, kd_;
+  float integral_ = 0;
+  float prevError_ = 0;
 };
 
-// PID Controllers
-PIDController rightMotorPID(4, 0.25, 0.005);
-PIDController leftMotorPID(4, 0.2, 0.005);
-PIDController vPID(8, 2, 1.5);
-PIDController omegaPID(10, 0, 1.5);
+// Outer loops of the go-to-goal behaviour
+PIDController linearPID(8, 2, 1.5);    // distance to goal -> v
+PIDController angularPID(10, 0, 1.5);  // heading error    -> w
 
+// --- Wheels -----------------------------------------------------------------
+struct Wheel {
+  uint8_t in1, in2;
+  PIDController pid;
+  volatile long pulses;  // counted in the ISR, cleared every control tick
+  float target;          // speed set-point
+  float rawSpeed;        // rpm, straight from the encoder (for telemetry)
+  float speed;           // rpm, low-pass filtered (used by the PID and odometry)
+  float prevRawSpeed;
+  int pwm;
+};
 
-// Right encoder ISR
-void readEncoderRight() {
-  int b = digitalRead(pulsePinR2);
-  int increment = (b > 0) ? 1 : -1;
-  pos_i_right += increment;
-}
+// Wheel speed loops: motor model from MATLAB's System Identification Toolbox,
+// gains from PID Tuner, then touched up on the robot.
+Wheel rightWheel = {RIGHT_IN1, RIGHT_IN2, PIDController(4, 0.25, 0.005), 0, 0, 0, 0, 0, 0};
+Wheel leftWheel = {LEFT_IN1, LEFT_IN2, PIDController(4, 0.2, 0.005), 0, 0, 0, 0, 0, 0};
 
-// Left encoder ISR
-void readEncoderLeft() {
-  int b = digitalRead(pulsePinL2);
-  int increment = (b > 0) ? -1 : 1;
-  pos_i_left += increment;
-}
+void rightEncoderISR() { rightWheel.pulses += digitalRead(RIGHT_ENC_B) ? 1 : -1; }
+void leftEncoderISR() { leftWheel.pulses += digitalRead(LEFT_ENC_B) ? -1 : 1; }  // mounted mirrored
 
-// Function to normalize the angle
-float normalizeAngle(float angle) {
-  return atan2(sin(angle), cos(angle));
-}
-
-// Function to calculate distance traveled
-float calculateDistance(float RPM, float time) {
-  return (2 * PI * wheelRadius * RPM / 60.0) * time;
-}
-
-void setMotor(int dir, int pwmVal, int in1, int in2) {
+// dir: 1 forward, -1 backward, 0 coast
+void setMotor(const Wheel &w, int dir, int pwm) {
   if (dir == 1) {
-    analogWrite(in1, 0);
-    analogWrite(in2, pwmVal);
+    analogWrite(w.in1, 0);
+    analogWrite(w.in2, pwm);
   } else if (dir == -1) {
-    analogWrite(in1, pwmVal);
-    analogWrite(in2, 0);
+    analogWrite(w.in1, pwm);
+    analogWrite(w.in2, 0);
   } else {
-    analogWrite(in1, 0);
-    analogWrite(in2, 0);
+    analogWrite(w.in1, 0);
+    analogWrite(w.in2, 0);
   }
 }
 
-// Function to control the motors
-void controlMotor(PIDController& pid, volatile long& pos_i, int in1, int in2, float& vFilt, float& vPrev, float targetVelocity, float deltaT) {
-  // Calculate the pulse difference since the last check
-  int deltaPulse = 0;
+// One tick of the inner speed loop for a single wheel.
+void runWheel(Wheel &w, float dt) {
+  long pulses;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    deltaPulse = pos_i;
-    pos_i = 0;  // Reset pulse count to avoid overflow
+    pulses = w.pulses;
+    w.pulses = 0;
   }
 
-  // Check if the position change is within bounds (absolute value <= 158)
-  if (abs(deltaPulse) > 158) {
-    setMotor(0, 0, in1, in2);
-    return; // Skip the update if the change is too large
+  if (abs(pulses) > MAX_PULSES_PER_TICK) {
+    setMotor(w, 0, 0);
+    return;
   }
 
-  // Convert pulses to velocity (RPM)
-  float velocity = ((float)deltaPulse / pulsePerRev) * (60.0 / deltaT);
+  w.rawSpeed = ((float)pulses / PULSES_PER_REV) * (60.0 / dt);  // rpm
+  // first-order low-pass on the speed (the raw estimate is very noisy at 10 ms)
+  w.speed = 0.854 * w.speed + 0.0728 * w.rawSpeed + 0.0728 * w.prevRawSpeed;
+  w.prevRawSpeed = w.rawSpeed;
 
-  // Low-pass filter for smoother velocity reading
-  vFilt = 0.854 * vFilt + 0.0728 * velocity + 0.0728 * vPrev;
-  vPrev = velocity;
-
-  // PID control
-  float controlSignal = pid.compute(targetVelocity, vFilt, deltaT);
-
-  // Determine motor direction and power
-  int dir = (controlSignal < 0) ? -1 : 1;
-  int pwm = (int)fabs(controlSignal);
-  pwm = (pwm > 255) ? 255 : pwm;
-
-  // Set motor
-  setMotor(dir, pwm, in1, in2);
-  if (in1 == IN1)
-  {
-    //Left motor
-    velocityLeft = velocity;
-    pwmLeft =  pwm;
-  } 
-  else if (in1 == IN3)
-  {
-    //Right motor
-    velocityRight = velocity;
-    pwmRight =  pwm;
-  }
+  float u = w.pid.compute(w.target, w.speed, dt);
+  w.pwm = min((int)fabs(u), 255);
+  setMotor(w, u < 0 ? -1 : 1, w.pwm);
 }
 
-// Function to update robot position
-void updateOdometry(float Dr, float Dl) {
-  float Dc = (Dr + Dl) / 2.0;
-  // Update orientation
-  phi = phi + (Dr - Dl) / wheelBase;
-  phi = normalizeAngle(phi);
-  
-  x = x + Dc * cos(phi);
-  y = y + Dc * sin(phi);
+void resetWheel(Wheel &w) {
+  setMotor(w, 0, 0);
+  w.target = 0;
+  w.rawSpeed = 0;
+  w.speed = 0;
+  w.prevRawSpeed = 0;
+  w.pwm = 0;
 }
-// Function to rotate the robot to a specific angle
-void gotoTheta(double targetPhi_g) {
-  unsigned long currentTime = millis();
-  if (currentTime - lastControlTimeTheta >= 10 && flagStop == 1  && abs(normalizeAngle(targetPhi_g - phi)) > angleTolerance) {
-    
-    float deltaT = (currentTime - lastControlTime) / 1000.0;
-    lastControlTimeTheta = currentTime;
 
-    // Calculate the orientation error
-    float orientationError = normalizeAngle(targetPhi_g - phi);
+// --- Odometry ---------------------------------------------------------------
+float x = 0, y = 0, phi = 0;  // cm, cm, rad
 
-    // PID control for angular velocity
-    float targetOmega = omegaPID.compute(orientationError, 0, deltaT);
+float normalizeAngle(float a) { return atan2(sin(a), cos(a)); }
 
-    if (targetOmega > 0){
-        targetOmega = constrain(targetOmega, 0, 30);
-      }
-      else{
-        targetOmega = constrain(targetOmega, -30, 0);
-      }
+// distance covered by a wheel turning at `rpm` for `dt` seconds
+float arcLength(float rpm, float dt) { return (2 * PI * WHEEL_RADIUS * rpm / 60.0) * dt; }
 
-    // Set motor speeds for in-place rotation
-    targetVelocityRight = targetOmega * wheelBase / (2 * wheelRadius);
-    targetVelocityLeft = -targetOmega * wheelBase / (2 * wheelRadius);
+void updateOdometry(float dRight, float dLeft) {
+  float dCenter = (dRight + dLeft) / 2.0;
+  phi = normalizeAngle(phi + (dRight - dLeft) / WHEEL_BASE);
+  x += dCenter * cos(phi);
+  y += dCenter * sin(phi);
+}
 
-    controlMotor(rightMotorPID, pos_i_right, IN3, IN4, v1Filt, v1Prev, targetVelocityRight, deltaT);
-    controlMotor(leftMotorPID, pos_i_left, IN1, IN2, v2Filt, v2Prev, targetVelocityLeft, deltaT);
+// Run both speed loops and integrate the odometry.
+void driveWheels(float dt) {
+  runWheel(rightWheel, dt);
+  runWheel(leftWheel, dt);
+  updateOdometry(arcLength(rightWheel.speed, dt), arcLength(leftWheel.speed, dt));
+}
 
-    float Dr = calculateDistance(v1Filt, deltaT);
-    float Dl = calculateDistance(v2Filt, deltaT);
-    updateOdometry(Dr, Dl);
-  } else if (abs(normalizeAngle(targetPhi_g - phi)) < angleTolerance){
-    // Once the orientation is correct, stop the motors
-    setMotor(0, 0, IN1, IN2);
-    setMotor(0, 0, IN3, IN4);
-    flagStop = 2;
-    v1Filt = 0; v1Prev = 0;
-    v2Filt = 0; v2Prev = 0;
-    targetVelocityRight = 0;
-    targetVelocityLeft = 0;
-    velocityLeft = 0; velocityRight = 0;
-    pwmLeft = 0; pwmRight = 0;
-    Serial.println("Orientation Reached.");
+// Unicycle (v, w) -> wheel set-points. The outer gains were tuned with this
+// exact scaling, so the set-points end up in the same units as the measured
+// wheel speed.
+void setWheelTargets(float v, float w) {
+  rightWheel.target = (2 * v + w * WHEEL_BASE) / (2 * WHEEL_RADIUS);
+  leftWheel.target = (2 * v - w * WHEEL_BASE) / (2 * WHEEL_RADIUS);
+}
+
+// --- Behaviours -------------------------------------------------------------
+enum Mode { IDLE, GOTO, ROTATE };
+Mode mode = IDLE;
+
+float goalX = 0, goalY = 0;  // cm
+float goalPhi = 0;           // rad
+unsigned long lastDriveMs = 0;  // last go-to-goal tick
+unsigned long lastTurnMs = 0;   // last rotate-in-place tick
+
+void stopRobot() {
+  resetWheel(rightWheel);
+  resetWheel(leftWheel);
+  mode = IDLE;
+}
+
+void startGoto(float gx, float gy, float gphiDeg) {
+  goalX = gx;
+  goalY = gy;
+  goalPhi = gphiDeg * DEG_TO_RAD;
+  mode = GOTO;
+}
+
+void startRotate(float phiRad) {
+  goalPhi = phiRad;
+  mode = ROTATE;
+}
+
+// Go-to-goal: steer towards (goalX, goalY); once there, turn to goalPhi.
+void gotoTarget() {
+  float dx = goalX - x;
+  float dy = goalY - y;
+  float distance = sqrt(dx * dx + dy * dy);
+
+  if (distance < POSITION_TOLERANCE) {
+    stopRobot();
+    Serial.println(F("Target Reached."));
+    delay(100);  // let it settle before turning
+    startRotate(goalPhi);
+    return;
   }
+
+  unsigned long now = millis();
+  if (now - lastDriveMs < CONTROL_PERIOD_MS) return;
+  float dt = (now - lastDriveMs) / 1000.0;
+  lastDriveMs = now;
+
+  driveWheels(dt);
+
+  dx = goalX - x;
+  dy = goalY - y;
+  distance = sqrt(dx * dx + dy * dy);
+  float headingError = normalizeAngle(atan2(dy, dx) - phi);
+
+  float v = constrain(linearPID.compute(distance, 0, dt), -MAX_LINEAR_CMD, MAX_LINEAR_CMD);
+  float w = angularPID.compute(headingError, 0, dt);
+  setWheelTargets(v, w);
 }
 
-// Function to navigate to a target point (targetX, targetY, targetPhi)
-void navigateToTarget(double targetX, double targetY, double targetPhi_g) {
-  unsigned long currentTime = millis();
-  float distanceToGoal = sqrt(pow(targetX - x, 2) + pow(targetY - y, 2));
-  // Similar to your existing control loop logic
-  if (currentTime - lastControlTime >= 10 && flagStop == 0 && distanceToGoal > positionTolerance){
-    float deltaT = (currentTime - lastControlTime) / 1000.0;
-    lastControlTime = currentTime;
+// Rotate in place to goalPhi.
+void turnToHeading() {
+  float error = normalizeAngle(goalPhi - phi);
 
-    // Motor control logic
-    controlMotor(rightMotorPID, pos_i_right, IN3, IN4, v1Filt, v1Prev, targetVelocityRight, deltaT);
-    controlMotor(leftMotorPID, pos_i_left, IN1, IN2, v2Filt, v2Prev, targetVelocityLeft, deltaT);
+  if (fabs(error) < ANGLE_TOLERANCE) {
+    stopRobot();
+    Serial.println(F("Orientation Reached."));
+    return;
+  }
 
-    float Dr = calculateDistance(v1Filt, deltaT);
-    float Dl = calculateDistance(v2Filt ,deltaT);
-    updateOdometry(Dr, Dl);
+  unsigned long now = millis();
+  if (now - lastTurnMs < CONTROL_PERIOD_MS) return;
+  lastTurnMs = now;
 
-    float phi_d = atan2(targetY - y, targetX - x);
-    distanceToGoal = sqrt(pow(targetX - x, 2) + pow(targetY - y, 2));
-    float orientationError = normalizeAngle(phi_d - phi);
+  // Heads-up: dt here is measured from the last *drive* tick, not from the
+  // previous turn tick. That came from the original code and is technically a
+  // bug, but the wheel loops lean on it: the growing dt makes them push harder
+  // and harder, which is what gets the wheels through the motor's dead band
+  // when the turn command gets small (with a "correct" dt the turn can stall
+  // in the dead band). The price is that the heading odometry gets a bit
+  // optimistic during the turn. All the final-heading results were recorded
+  // like this, so it stays until someone adds proper dead-band compensation.
+  float dt = (now - lastDriveMs) / 1000.0;
 
-    if (distanceToGoal > positionTolerance) {
-      // Velocity and angular velocity control
-      float targetV = vPID.compute(distanceToGoal, 0, deltaT);
-      float targetOmega = omegaPID.compute(orientationError, 0, deltaT);
+  float w = constrain(angularPID.compute(error, 0, dt), -MAX_TURN_CMD, MAX_TURN_CMD);
+  setWheelTargets(0, w);
+  driveWheels(dt);
+}
 
-      if (targetV > 0){
-        targetV = constrain(targetV, 0, 300);
-      }
-      else{
-        targetV = constrain(targetV, -300, 0);
-      }
+// --- Serial commands --------------------------------------------------------
+char line[48];
+uint8_t lineLength = 0;
 
-      // Set motor speeds
-      targetVelocityRight = (2 * targetV + targetOmega * wheelBase) / (2 * wheelRadius);
-      targetVelocityLeft = (2 * targetV - targetOmega * wheelBase) / (2 * wheelRadius);
-
+void handleCommand(char *cmd) {
+  if (strncmp(cmd, "ROTATE", 6) == 0) {
+    char *comma = strchr(cmd, ',');
+    if (comma) {
+      // start the dt ramp fresh, like right after a drive (see turnToHeading)
+      lastDriveMs = lastTurnMs = millis();
+      startRotate(atof(comma + 1) * DEG_TO_RAD);
     }
-  }
-  else if (flagStop == 1 && distanceToGoal < positionTolerance){
-  gotoTheta(targetPhi_g*3.1415/180);
-  } 
-  else if (flagStop == 0 && distanceToGoal < positionTolerance) {
-  setMotor(0, 0, IN1, IN2);
-  setMotor(0, 0, IN3, IN4);
-  flagStop = 1;
-  v1Filt = 0; v1Prev = 0;
-  v2Filt = 0; v2Prev = 0;
-  targetVelocityRight = 0;
-  targetVelocityLeft = 0;
-  velocityLeft = 0; velocityRight = 0;
-  pwmLeft = 0; pwmRight = 0;
-  Serial.println("Target Reached.");
-  delay(100);
-  gotoTheta(targetPhi_g*3.1415/180.0);
+  } else if (strcmp(cmd, "STOP") == 0) {
+    stopRobot();
+  } else {
+    char *c1 = strchr(cmd, ',');
+    char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+    if (c1 && c2) startGoto(atof(cmd), atof(c1 + 1), atof(c2 + 1));
   }
 }
 
-
-
-
-// UART reading and parsing function
-void readTargetCoordinates() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();  // Remove any extra whitespace
-
-    if (input.startsWith("ROTATE")) {
-      // Handle rotation command
-      String rotationAngle = input.substring(input.indexOf(',') + 1);
-      targetPhi_g = rotationAngle.toDouble();
-      flagStop = 1;  // Stop navigation and start rotation
-      //Serial.println("Rotation command received.");
-    }
-    else if (input.equals("STOP")) {
-      // Handle stop command
-      flagStop = 2;  // Stop all movement
-      setMotor(0, 0, IN1, IN2);
-      setMotor(0, 0, IN3, IN4);
-      v1Filt = 0; v1Prev = 0;
-      v2Filt = 0; v2Prev = 0;
-      targetVelocityRight = 0;
-      targetVelocityLeft = 0;
-      velocityLeft = 0; velocityRight = 0;
-      pwmLeft = 0; pwmRight = 0;
-      //Serial.println("Stop command received.");
-    }
-    else {
-      // Handle target coordinates
-      int commaIndex1 = input.indexOf(',');
-      int commaIndex2 = input.lastIndexOf(',');
-
-      if (commaIndex1 != -1 && commaIndex2 != -1) {
-        targetX = input.substring(0, commaIndex1).toDouble();
-        targetY = input.substring(commaIndex1 + 1, commaIndex2).toDouble();
-        targetPhi_g = input.substring(commaIndex2 + 1).toDouble();
-
-        flagStop = 0;  // Reset flag to allow new movement
-        //Serial.println("Target coordinates received.");
-      } else {
-        //Serial.println("Invalid input received.");
+// Non-blocking line reader (readStringUntil() could stall the control loop).
+void readSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (lineLength > 0) {
+        line[lineLength] = '\0';
+        handleCommand(line);
+        lineLength = 0;
       }
+    } else if (lineLength < sizeof(line) - 1) {
+      line[lineLength++] = c;
     }
   }
 }
+
+void sendTelemetry() {
+  Serial.print(x);
+  Serial.print(',');
+  Serial.print(y);
+  Serial.print(',');
+  Serial.print(phi);
+  Serial.print(',');
+  Serial.print(leftWheel.target);
+  Serial.print(',');
+  Serial.print(rightWheel.target);
+  Serial.print(',');
+  Serial.print(leftWheel.rawSpeed);
+  Serial.print(',');
+  Serial.print(leftWheel.pwm);
+  Serial.print(',');
+  Serial.print(rightWheel.rawSpeed);
+  Serial.print(',');
+  Serial.println(rightWheel.pwm);
+}
+
+// --- Main -------------------------------------------------------------------
+unsigned long lastTelemetryMs = 0;
+
 void setup() {
   Serial.begin(115200);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(pulsePinR1, INPUT); pinMode(pulsePinR2, INPUT);
-  pinMode(pulsePinL1, INPUT); pinMode(pulsePinL2, INPUT);
-  attachInterrupt(digitalPinToInterrupt(pulsePinR1), readEncoderRight, RISING);
-  attachInterrupt(digitalPinToInterrupt(pulsePinL1), readEncoderLeft, RISING);
 
-  delay(3000);
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+
+  pinMode(RIGHT_ENC_A, INPUT);
+  pinMode(RIGHT_ENC_B, INPUT);
+  pinMode(LEFT_ENC_A, INPUT);
+  pinMode(LEFT_ENC_B, INPUT);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_A), rightEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENC_A), leftEncoderISR, RISING);
+
+  delay(3000);  // give the Pi time to open the port
 }
-unsigned long previousPrintTime = 0;  // Variable to store the last time data was printed
+
 void loop() {
-  readTargetCoordinates();  // Continuously check for new coordinates via UART
-  /*Serial.print(targetX);
-  Serial.print(" ");
-  Serial.println(targetY);*/
-  navigateToTarget(targetX, targetY, targetPhi_g);
-  
-  // Get the current time in milliseconds
-  unsigned long currentTimePrint = millis();
+  readSerial();
 
-  // Check if 50ms have passed since the last print
-  if (currentTimePrint - previousPrintTime >= 50) {
-    // Update the last print time
-    previousPrintTime = currentTimePrint;
+  if (mode == GOTO)
+    gotoTarget();
+  else if (mode == ROTATE)
+    turnToHeading();
 
-    // Print x, y, and phi in one line using a single Serial.println statement
-    Serial.println(String(x) + "," + String(y) + "," + String(phi) + "," + String(targetVelocityLeft) + ","+ String(targetVelocityRight) + "," +String(velocityLeft) + "," + String(pwmLeft) + "," + String(velocityRight) + "," + String(pwmRight));
+  unsigned long now = millis();
+  if (now - lastTelemetryMs >= TELEMETRY_PERIOD_MS) {
+    lastTelemetryMs = now;
+    sendTelemetry();
   }
-
 }
