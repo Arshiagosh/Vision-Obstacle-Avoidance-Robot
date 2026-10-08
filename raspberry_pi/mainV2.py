@@ -25,7 +25,7 @@ def obstacle_avoidance_mode(sensor, camera_processing, serial_comm, servo, obsta
     distances = []
     time.sleep(2)
     distance = sensor.measure_distance(TRIG_RIGHT, ECHO_RIGHT)
-    distances.append(distance if distance <= (MAX_OBSTACLE_DISTANCE+10) else None)
+    distances.append(distance if distance is not None and distance <= (MAX_OBSTACLE_DISTANCE+10) else None)
     # print(distance)
     angles = [40, 70, 100, 130, 170]
     for angle in angles:
@@ -46,7 +46,7 @@ def obstacle_avoidance_mode(sensor, camera_processing, serial_comm, servo, obsta
             distances.append(None)'''
     
     distance = sensor.measure_distance(TRIG_LEFT, ECHO_LEFT)
-    distances.append(distance if distance <= (MAX_OBSTACLE_DISTANCE+10) else None)
+    distances.append(distance if distance is not None and distance <= (MAX_OBSTACLE_DISTANCE+10) else None)
     print(distances)
     
     # Calculate avoidance angle
@@ -89,7 +89,7 @@ def main():
                 sensor.measure_distance(TRIG_LEFT, ECHO_LEFT)
             ]
             # print(distances)
-            if any(d < MAX_OBSTACLE_DISTANCE for d in distances):
+            if any(d is not None and d < MAX_OBSTACLE_DISTANCE for d in distances):
                 print("Obstacle detected! Entering avoidance mode.")
                 serial_comm.send_stop_command()  # Send stop command
                 obstacle_avoidance_mode(sensor, camera_processing, serial_comm, servo_control, obstacle_avoidance)
