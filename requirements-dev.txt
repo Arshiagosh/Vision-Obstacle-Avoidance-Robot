@@ -1,0 +1,6 @@
+# For running the tests and plotting the logs on a normal computer
+numpy>=1.20
+matplotlib>=3.5
+opencv-python-headless>=4.5
+pyserial>=3.5
+pytest>=7
