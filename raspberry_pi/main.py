@@ -43,7 +43,7 @@ def main():
         camera_distance = camera_processing.calculate_distance_from_object()
         if camera_distance is not None:
             print(f"Object detected at {angle} degrees, Distance: {camera_distance:.2f} cm")
-        distances.append(camera_distance if camera_distance <= MAX_OBSTACLE_DISTANCE else None)
+        distances.append(camera_distance if camera_distance is not None and camera_distance <= MAX_OBSTACLE_DISTANCE else None)
 
     # Left ultrasonic measurement
     left_distance = ultrasonic_sensors.measure_distance(TRIG_LEFT, ECHO_LEFT)

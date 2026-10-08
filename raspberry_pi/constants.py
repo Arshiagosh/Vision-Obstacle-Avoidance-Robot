@@ -12,6 +12,7 @@ SERVO_PIN = 18  # GPIO pin for SG90 servo
 # Camera and object detection constants
 KNOWN_DISTANCE = 30.0  # cm (known distance for camera calibration)
 KNOWN_WIDTH = 6.75     # cm (object width)
+FOCAL_LENGTH = 915.555 # px, the value the robot ran with during the tests
 LOWER_GREEN = [35, 40, 40]  # Lower bound for green color in HSV
 UPPER_GREEN = [85, 255, 255]  # Upper bound for green color in HSV
 
