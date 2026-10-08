@@ -1,0 +1,8 @@
+# On Raspberry Pi OS it's easiest to get these from apt instead:
+#   sudo apt install python3-serial python3-pigpio pigpio python3-opencv python3-picamera2
+#   sudo systemctl enable --now pigpiod
+pyserial>=3.5
+pigpio>=1.78
+opencv-python>=4.5
+numpy>=1.20
+# picamera2 ships with Raspberry Pi OS (Bullseye and newer)
