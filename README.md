@@ -92,7 +92,7 @@ python analysis/plot_run.py data/logs/obstacles_200_0.txt --goal 200 0
   <img src="docs/images/robot_top.jpg" height="230" alt="Top view">
 </p>
 
-| | |
+| Part | Details |
 |---|---|
 | Low level | Arduino Uno, L298N, 2 × 12 V gear motors with MITSUMI encoders (2625 pulses/rev) |
 | High level | Raspberry Pi 4 (8 GB), Pi Camera v1.3 on an SG90 servo, 3 × HC-SR04 |
