@@ -12,13 +12,19 @@ ground truth (no motion capture, no IMU), so these show what the robot
 
 | File | Start → goal `(x, y, φ)` | What happened | Video |
 |---|---|---|---|
-| `logs/goal_100_0.txt` | (0, 0, 0°) → (100, 0, 0°) | straight run, stops inside the 5 cm tolerance | `media/videos/goal_100_0.mp4` |
-| `logs/goal_100_-50.txt` | (0, 0, 0°) → (100, −50, 0°) | turns towards the goal, drives, then rotates in place back to 0° | `media/videos/goal_100_-50.mp4` |
+| `logs/goal_100_0.txt` | (0, 0, 0°) → (100, 0, 0°) | straight run, stops inside the 5 cm tolerance | [`goal_100_0.mp4`](../media/videos/goal_100_0.mp4) |
+| `logs/goal_100_-50.txt` | (0, 0, 0°) → (100, −50, 0°) | turns towards the goal, drives, then turns in place back to 0° | [`goal_100_-50.mp4`](../media/videos/goal_100_-50.mp4) |
 | `logs/goal_100_-50_take1.txt` | (0, 0, 0°) → (100, −50, 0°) | an earlier successful take of the same goal | – |
-| `logs/obstacles_200_0.txt` | (0, 0) → (200, 0) | three obstacles on the straight line; the robot stops, scans, turns left around them and reaches the goal | `media/videos/obstacles.mp4` |
+| `logs/obstacles_200_0.txt` | (0, 0) → (200, 0) | three obstacles on the straight line; the robot stops, scans, goes around them on the left and reaches the goal | – |
 
-The (0, 100) run was filmed too, but its log file came out as all zeros, so
-only the video and the figure in the report survive for that one.
+Two runs from the thesis only survive as a video and a figure:
+
+- (0, 0) → (0, 100): the log file came out as all zeros.
+  Video: [`goal_0_100.mp4`](../media/videos/goal_0_100.mp4)
+- (0, 0) → (150, 0) with two obstacles the robot can pass between.
+  Video: [`obstacles_150_0.mp4`](../media/videos/obstacles_150_0.mp4)
+
+Their path plots from the report are in [`docs/figures/report`](../docs/figures/report).
 
 ## `logs/tuning/`
 
