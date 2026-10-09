@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Vision-Obstacle-Avoidance-Robot"
+abstract: >-
+  Code, data and report of a B.Sc. project: a differential-drive wheeled mobile
+  robot that drives to a goal pose and avoids obstacles using a camera, ultrasonic
+  sensors and wheel odometry (Arduino Uno low-level control, Raspberry Pi high-level control).
+authors:
+  - family-names: Goshtasbi
+    given-names: Arshia
+    affiliation: Iran University of Science and Technology
+type: software
+license: MIT
+repository-code: "https://github.com/Arshiagosh/Vision-Obstacle-Avoidance-Robot"
+keywords:
+  - mobile robot
+  - obstacle avoidance
+  - bubble rebound
+  - odometry
+  - PID control
+  - Raspberry Pi
+  - Arduino
+preferred-citation:
+  type: thesis
+  thesis-type: "B.Sc. thesis"
+  title: "Design, Construction and Control of a Wheeled Mobile Robot for Obstacle Avoidance Using a Camera and Image Processing"
+  authors:
+    - family-names: Goshtasbi
+      given-names: Arshia
+  institution:
+    name: Iran University of Science and Technology
+  year: 2024

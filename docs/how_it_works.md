@@ -17,8 +17,8 @@ flowchart LR
         GTG["go-to-goal<br/>v and ω PIDs"] --> WPID["wheel speed PIDs"] --> DRV["L298N"] --> MOT["DC motors"]
         MOT --> ENC["encoders"] --> ODO["odometry"] --> GTG
     end
-    MAIN -- "x,y,φ · ROTATE · STOP" --> GTG
-    ODO -- "pose + motor data, 20 Hz" --> MAIN
+    MAIN -->|"x,y,φ · ROTATE · STOP"| GTG
+    ODO -->|"pose + motor data, 20 Hz"| MAIN
 ```
 
 ---
