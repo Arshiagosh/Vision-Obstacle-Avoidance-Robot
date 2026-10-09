@@ -83,7 +83,7 @@ and two outer PIDs pick $`v`$ and $`\omega`$:
 - $`v`$ from the distance to the goal $`d = \sqrt{(x_g - x)^2 + (y_g - y)^2}`$,
   which slows it down as it gets close,
 - $`\omega`$ from the heading error $`\varphi_d - \varphi`$, with
-  $`\varphi_d = \operatorname{atan2}(y_g - y,\; x_g - x)`$ wrapped to $`(-\pi, \pi]`$.
+  $`\varphi_d = \text{atan2}(y_g - y,\; x_g - x)`$ wrapped to $`(-\pi, \pi]`$.
 
 | Loop | $`K_p`$ | $`K_i`$ | $`K_d`$ | limit |
 |---|---|---|---|---|
